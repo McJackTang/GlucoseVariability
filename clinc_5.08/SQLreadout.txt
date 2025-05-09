@@ -1,0 +1,120 @@
+-- MIMIC-IV血糖数据分析查询
+WITH patient_cohort AS (
+    SELECT 
+        p.subject_id,
+        p.gender,
+        a.hadm_id,
+        a.admittime,
+        a.dischtime,
+        a.deathtime,
+        a.hospital_expire_flag,
+        EXTRACT(EPOCH FROM (a.dischtime - a.admittime))/86400 AS los_days,
+        p.anchor_age AS age_at_admission  -- 直接使用anchor_age作为年龄
+    FROM 
+        mimiciv_hosp.patients p
+    JOIN 
+        mimiciv_hosp.admissions a ON p.subject_id = a.subject_id
+),
+
+glucose_lab AS (
+    SELECT 
+        l.subject_id,
+        l.hadm_id,
+        l.charttime,
+        l.itemid,
+        l.valuenum
+    FROM 
+        mimiciv_hosp.labevents l
+    WHERE 
+        l.itemid IN (
+            50809, -- 血糖
+            50931  -- 葡萄糖
+        )
+        AND l.valuenum IS NOT NULL
+),
+
+glucose_chart AS (
+    SELECT 
+        c.subject_id,
+        c.hadm_id,
+        c.charttime,
+        c.itemid,
+        c.valuenum
+    FROM 
+        mimiciv_icu.chartevents c
+    WHERE 
+        c.itemid IN (
+            807,   -- Fingerstick血糖
+            811,   -- 血糖
+            1529,  -- 血糖
+            3744,  -- 血糖水平
+            3745,  -- 血糖手指检测
+            225664 -- 血糖
+        )
+        AND c.valuenum IS NOT NULL
+),
+
+all_glucose AS (
+    SELECT 
+        subject_id,
+        hadm_id,
+        charttime,
+        'lab' AS source,
+        valuenum AS glucose_value
+    FROM 
+        glucose_lab
+    
+    UNION ALL
+    
+    SELECT 
+        subject_id,
+        hadm_id,
+        charttime,
+        'chart' AS source,
+        valuenum AS glucose_value
+    FROM 
+        glucose_chart
+),
+
+glucose_stats AS (
+    SELECT 
+        g.hadm_id,
+        AVG(g.glucose_value) AS mean_glucose,
+        STDDEV(g.glucose_value) AS std_glucose,
+        MAX(g.glucose_value) AS max_glucose,
+        MIN(g.glucose_value) AS min_glucose,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY g.glucose_value) AS median_glucose,
+        COUNT(g.glucose_value) AS glucose_measurement_count,
+        SUM(CASE WHEN g.glucose_value > 180 THEN 1 ELSE 0 END) / NULLIF(COUNT(g.glucose_value), 0) AS hyperglycemia_ratio,
+        SUM(CASE WHEN g.glucose_value < 70 THEN 1 ELSE 0 END) / NULLIF(COUNT(g.glucose_value), 0) AS hypoglycemia_ratio,
+        SUM(CASE WHEN g.glucose_value BETWEEN 70 AND 180 THEN 1 ELSE 0 END) / NULLIF(COUNT(g.glucose_value), 0) AS normal_glucose_ratio,
+        MAX(g.glucose_value) - MIN(g.glucose_value) AS glucose_range
+    FROM 
+        all_glucose g
+    GROUP BY 
+        g.hadm_id
+)
+
+-- 最终结果查询
+SELECT 
+    pc.*,
+    gs.*,
+    CASE 
+        WHEN pc.age_at_admission < 18 THEN '0-17'
+        WHEN pc.age_at_admission BETWEEN 18 AND 30 THEN '18-30'
+        WHEN pc.age_at_admission BETWEEN 31 AND 50 THEN '31-50'
+        WHEN pc.age_at_admission BETWEEN 51 AND 70 THEN '51-70'
+        ELSE '71+' 
+    END AS age_group,
+    CASE WHEN pc.deathtime IS NOT NULL THEN 1 ELSE 0 END AS mortality
+FROM 
+    patient_cohort pc
+LEFT JOIN 
+    glucose_stats gs ON pc.hadm_id = gs.hadm_id
+WHERE 
+    gs.mean_glucose IS NOT NULL
+    AND pc.age_at_admission IS NOT NULL
+    AND pc.los_days IS NOT NULL
+    AND pc.los_days > 0
+ORDER BY 
+    pc.subject_id, pc.admittime;
